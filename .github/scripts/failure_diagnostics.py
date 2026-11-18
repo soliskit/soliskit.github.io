@@ -82,6 +82,89 @@ def traversal_error(error):
     raise error
 
 
+def nested_receipt(paths, name, selector):
+    """Keep availability facts even when one receipt cannot supply typed facts."""
+    if name not in paths:
+        return {"present": False, "parsed": False, "status": "missing"}
+    result = {"present": True, "parsed": False, "status": "malformed"}
+    try:
+        record = json.loads(safe_read(paths[name]))
+    except (ValueError, UnicodeError, RecursionError):
+        return result
+    result.update(parsed=True, status="invalid")
+    try:
+        require(isinstance(record, dict))
+        facts = selector(record)
+    except ValueError:
+        return result
+    result.update(status="valid", facts=facts)
+    return result
+
+
+def bool_fields(record, names):
+    selected = {}
+    for field in names:
+        if field in record:
+            require(type(record[field]) is bool)
+            selected[field] = record[field]
+    return selected
+
+
+def setup_facts(record):
+    require(
+        record.get("verdict")
+        in ("INCOMPLETE", "PRIVILEGED_SETUP_NATIVE_COMPLETION_ONLY")
+    )
+    return {
+        "verdict": record["verdict"],
+        **bool_fields(record, ["interrupted"]),
+        "errorPresent": bool(record.get("errors")),
+        "retentionErrorPresent": bool(record.get("retentionErrors")),
+    }
+
+
+def native_facts(record):
+    result = bool_fields(record, ["timeout", "interrupted"])
+    if "rc" in record:
+        rc = record["rc"]
+        require(rc is None or (type(rc) is int and -255 <= rc <= 255))
+        result["rc"] = rc
+    result["errorPresent"] = bool(record.get("error") or record.get("errors"))
+    result["receiptWriteErrorPresent"] = bool(record.get("receiptWriteError"))
+    for field, names in [
+        (
+            "cleanup",
+            [
+                "groupAbsent",
+                "leaderRetained",
+                "term",
+                "kill",
+                "emergencyKill",
+                "noChildStarted",
+            ],
+        ),
+        ("descendants", ["allAbsent", "term", "kill", "noChildStarted"]),
+    ]:
+        if field in record:
+            require(isinstance(record[field], dict))
+            result[field] = bool_fields(record[field], names)
+            result[field]["errorPresent"] = bool(
+                record[field].get("error") or record[field].get("cleanupError")
+            )
+    return result
+
+
+def setup_results(paths):
+    prefix = "privileged-setup/"
+    return {
+        "invalidated": prefix + "SETUP_INVALIDATED.json" in paths,
+        "setup": nested_receipt(paths, prefix + "setup-final.json", setup_facts),
+        "native": nested_receipt(
+            paths, prefix + "fixed-browser-setup.json", native_facts
+        ),
+    }
+
+
 def export(source, destination, environment):
     source = pathlib.Path(source)
     destination = pathlib.Path(destination)
@@ -149,6 +232,8 @@ def export(source, destination, environment):
                 # No digest of raw output: short secrets can be guessed from
                 # hashes too. Byte count is sufficient to show stream presence.
                 item["streams"][suffix] = {"bytes": len(data)}
+        if name == "hosted-browser-install-once":
+            item["setupResults"] = setup_results(paths)
         output["stages"].append(item)
     encoded = (json.dumps(output, indent=2) + "\n").encode()
     text = encoded.decode()
