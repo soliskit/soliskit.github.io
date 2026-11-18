@@ -129,6 +129,204 @@ class DiagnosticsTests(unittest.TestCase):
             self.export()
         self.assertEqual(list(self.target.iterdir()), [])
 
+    def nested(self, setup=None, native=None):
+        (self.source / "privileged-setup").mkdir(exist_ok=True)
+        self.write("hosted-browser-install-once.json", {"rc": 1})
+        if setup is not None:
+            self.write("privileged-setup/setup-final.json", setup)
+        if native is not None:
+            self.write("privileged-setup/fixed-browser-setup.json", native)
+
+    def nested_output(self):
+        self.export()
+        stages = json.loads((self.target / "summary.json").read_text())["stages"]
+        return next(x for x in stages if x["stage"] == "hosted-browser-install-once")[
+            "setupResults"
+        ]
+
+    def test_nested_valid_typed_fields_only(self):
+        self.nested(
+            {
+                "verdict": "INCOMPLETE",
+                "interrupted": False,
+                "errors": ["private failure"],
+                "retentionErrors": [],
+                "isolatedTemporaryRoot": "/private/random-path",
+                "supervisorUid": 0,
+                "deadlineMonotonic": 12345,
+            },
+            {
+                "rc": 1,
+                "timeout": True,
+                "interrupted": False,
+                "errors": ["private failure"],
+                "receiptWriteError": "private failure",
+                "cleanup": {
+                    "groupAbsent": True,
+                    "leaderRetained": False,
+                    "term": True,
+                    "kill": False,
+                    "emergencyKill": False,
+                    "noChildStarted": False,
+                    "cleanupError": "private failure",
+                    "group": 123,
+                },
+                "descendants": {
+                    "allAbsent": True,
+                    "term": False,
+                    "kill": False,
+                    "noChildStarted": False,
+                    "error": "private failure",
+                    "adoptedReaped": [123],
+                },
+            },
+        )
+        self.write("privileged-setup/SETUP_INVALIDATED.json", {"reason": "private"})
+        result = self.nested_output()
+        self.assertTrue(result["invalidated"])
+        for name in ["setup", "native"]:
+            self.assertEqual(result[name]["status"], "valid")
+            self.assertTrue(result[name]["present"])
+            self.assertTrue(result[name]["parsed"])
+        self.assertEqual(
+            result["setup"]["facts"],
+            {
+                "verdict": "INCOMPLETE",
+                "interrupted": False,
+                "errorPresent": True,
+                "retentionErrorPresent": False,
+            },
+        )
+        native = result["native"]["facts"]
+        self.assertEqual(native["rc"], 1)
+        self.assertTrue(native["timeout"])
+        self.assertTrue(native["receiptWriteErrorPresent"])
+        self.assertTrue(native["cleanup"]["errorPresent"])
+        self.assertTrue(native["descendants"]["errorPresent"])
+        text = json.dumps(result)
+        for excluded in ["private", "random-path", "12345", "supervisorUid", 'group"']:
+            self.assertNotIn(excluded, text)
+
+    def test_nested_both_missing_still_reports_presence(self):
+        self.nested()
+        result = self.nested_output()
+        for name in ["setup", "native"]:
+            self.assertEqual(
+                result[name], {"present": False, "parsed": False, "status": "missing"}
+            )
+        self.assertFalse(result["invalidated"])
+
+    def test_nested_each_missing_preserves_other_facts(self):
+        for missing in ["setup", "native"]:
+            with self.subTest(missing=missing):
+                paths = {}
+                self.nested()
+                if missing == "setup":
+                    self.write("privileged-setup/fixed-browser-setup.json", {"rc": -9})
+                else:
+                    self.write(
+                        "privileged-setup/setup-final.json", {"verdict": "INCOMPLETE"}
+                    )
+                paths = {
+                    x.relative_to(self.source).as_posix(): x
+                    for x in self.source.rglob("*.json")
+                    if x.name
+                    != (
+                        "setup-final.json"
+                        if missing == "setup"
+                        else "fixed-browser-setup.json"
+                    )
+                }
+                result = MODULE.setup_results(paths)
+                self.assertEqual(result[missing]["status"], "missing")
+                other = "native" if missing == "setup" else "setup"
+                self.assertEqual(result[other]["status"], "valid")
+                self.assertIn("facts", result[other])
+
+    def test_nested_malformed_and_invalid_are_distinct_and_no_partial_facts(self):
+        self.nested({"verdict": "INCOMPLETE"}, {"rc": True})
+        (self.source / "privileged-setup/setup-final.json").write_bytes(b"\xff")
+        result = self.nested_output()
+        self.assertEqual(
+            result["setup"], {"present": True, "parsed": False, "status": "malformed"}
+        )
+        self.assertEqual(
+            result["native"], {"present": True, "parsed": True, "status": "invalid"}
+        )
+
+    def test_nested_invalid_type_matrix(self):
+        for selector, record in [
+            (MODULE.setup_facts, {}),
+            (MODULE.setup_facts, {"verdict": "private value"}),
+            (MODULE.setup_facts, {"verdict": "INCOMPLETE", "interrupted": "secret"}),
+            (MODULE.native_facts, {"rc": 256}),
+            (MODULE.native_facts, {"rc": -256}),
+            (MODULE.native_facts, {"rc": "secret"}),
+            (MODULE.native_facts, {"timeout": 0}),
+            (MODULE.native_facts, {"interrupted": None}),
+            (MODULE.native_facts, {"cleanup": []}),
+            (MODULE.native_facts, {"descendants": {"allAbsent": "secret"}}),
+        ]:
+            with self.subTest(record=record), self.assertRaises(ValueError):
+                selector(record)
+
+    def test_nested_partial_native_does_not_invent_missing_flags(self):
+        self.assertEqual(
+            MODULE.native_facts({"rc": None}),
+            {"rc": None, "errorPresent": False, "receiptWriteErrorPresent": False},
+        )
+        self.assertEqual(
+            MODULE.setup_facts({"verdict": "PRIVILEGED_SETUP_NATIVE_COMPLETION_ONLY"})[
+                "verdict"
+            ],
+            "PRIVILEGED_SETUP_NATIVE_COMPLETION_ONLY",
+        )
+
+    def test_nested_arbitrary_content_never_leaves_runner(self):
+        secret = "arbitrary-unpatterned-value-unique"
+        self.nested(
+            {
+                "verdict": "INCOMPLETE",
+                "errors": [secret],
+                "retentionErrors": [secret],
+                "identity": secret,
+                "isolatedTemporaryRoot": secret,
+            },
+            {
+                "rc": 1,
+                "error": secret,
+                "errors": [secret],
+                "receiptWriteError": secret,
+                "environment": {"COOKIE": secret},
+                "command": [secret],
+                "cleanup": {"cleanupError": secret},
+                "descendants": {"error": secret},
+            },
+        )
+        self.export({"AUTH": secret})
+        text = (self.target / "summary.json").read_text()
+        self.assertNotIn(secret, text)
+        self.assertNotIn("sha256", text)
+        self.assertNotIn("identity", text)
+
+    def test_nested_symlink_and_size_refused_before_selection(self):
+        self.nested({"verdict": "INCOMPLETE"})
+        path = self.source / "privileged-setup/setup-final.json"
+        path.unlink()
+        path.symlink_to(self.source / "supervisor.json")
+        self.refused()
+        path.unlink()
+        path.write_text("x" * 1024)
+        with mock.patch.object(MODULE, "MAX_FILE", 512):
+            self.refused()
+
+    def test_nested_receipts_do_not_add_unreached_outer_stage(self):
+        self.nested({"verdict": "INCOMPLETE"}, {"rc": 1})
+        (self.source / "hosted-browser-install-once.json").unlink()
+        self.export()
+        text = (self.target / "summary.json").read_text()
+        self.assertNotIn("setupResults", text)
+
     def test_workflow_preserves_failure_and_release_boundary(self):
         text = (pathlib.Path(__file__).parents[1] / "workflows/pages.yml").read_text()
         diagnostics = text.split("      - name: Select safe failure diagnostics", 1)[1]
