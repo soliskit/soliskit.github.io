@@ -42,8 +42,8 @@ jobs:
       - uses: actions/setup-python@v6
       - run: python3 -m unittest discover -s .github/tests -p 'test_*.py'
       - run: python3 -m pip install ruff==0.17.4
-      - run: ruff check .github/scripts/tetris_release.py .github/tests
-      - run: ruff format --check .github/scripts/tetris_release.py .github/tests
+      - run: ruff check .github/scripts/tetris_release.py .github/scripts/failure_diagnostics.py .github/tests
+      - run: ruff format --check .github/scripts/tetris_release.py .github/scripts/failure_diagnostics.py .github/tests
 
   qualify:
     if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.site_qualification_run == ''
@@ -82,6 +82,21 @@ jobs:
           QUALIFICATION_SOURCE_MODE: main
           QUALIFICATION_EVIDENCE: ${{ runner.temp }}/tetris-qualification
         run: python3 .github/offline-current/supervise.py
+      - name: Select safe failure diagnostics
+        if: failure()
+        id: diagnostics
+        env:
+          QUALIFICATION_EVIDENCE: ${{ runner.temp }}/tetris-qualification
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/failure_diagnostics.py "${{ runner.temp }}/failure-diagnostics"
+      - name: Retain failure diagnostics for three days
+        if: failure() && steps.diagnostics.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: failure-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/failure-diagnostics/
+          if-no-files-found: error
+          retention-days: 3
       - name: Package the exact checked release and screenshot proofs
         env:
           QUALIFICATION_EVIDENCE: ${{ runner.temp }}/tetris-qualification
