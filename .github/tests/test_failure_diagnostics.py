@@ -174,6 +174,83 @@ class DiagnosticsTests(unittest.TestCase):
             "typedSetupResults"
         ]
 
+    def preflight_check(self, name="package-status"):
+        return {
+            "name": name,
+            "native": {
+                "rc": 0,
+                "timeout": False,
+                "interrupted": False,
+                "cleanup": {"groupAbsent": True},
+                "descendants": {"allAbsent": True},
+                "environment": {"PRIVATE_VALUE": "not-for-export"},
+                "stdout": "not-for-export",
+                "error": "",
+            },
+        }
+
+    def test_fixed_preflight_checks_are_bound_and_allowlisted(self):
+        record = self.typed_phase(status="parse-or-command-error")
+        record["checks"] = [
+            self.preflight_check(name) for name in MODULE.PREFLIGHT_CHECKS
+        ]
+        record["checks"][-1]["native"]["rc"] = 1
+        facts = MODULE.phase_facts(record, "dependency-preflight", self.state)
+        selected = facts["checkOutcomes"]
+        self.assertEqual(selected["status"], "valid")
+        self.assertEqual(
+            [item["check"] for item in selected["checks"]],
+            list(MODULE.PREFLIGHT_CHECKS),
+        )
+        self.assertEqual(selected["checks"][-1]["status"], "native-not-success")
+        self.assertNotIn("not-for-export", json.dumps(selected))
+        record["identity"]["GITHUB_RUN_ID"] = "999"
+        with self.assertRaises(ValueError):
+            MODULE.phase_facts(record, "dependency-preflight", self.state)
+
+    def test_missing_or_invalid_preflight_checks_stay_unknown(self):
+        check = self.preflight_check()
+        variants = [
+            None,
+            [],
+            "bad",
+            [None],
+            [self.preflight_check("other")],
+            [check, check],
+            [self.preflight_check("package-audit")],
+        ]
+        for native in [
+            {},
+            {"rc": True},
+            {"rc": 1.0},
+            {"rc": 999},
+            {"rc": 1, "timeout": "false"},
+        ]:
+            variants.append([{"name": "package-status", "native": native}])
+        for checks in variants:
+            with self.subTest(checks=checks):
+                self.assertEqual(
+                    MODULE.preflight_check_facts({"checks": checks}),
+                    {"status": "unknown"},
+                )
+        self.assertEqual(MODULE.preflight_check_facts({}), {"status": "unknown"})
+
+    def test_preflight_native_flags_do_not_claim_installed_state(self):
+        for mutation in [
+            lambda n: n.update(rc=1),
+            lambda n: n.update(timeout=True),
+            lambda n: n.update(interrupted=True),
+            lambda n: n.update(error="not-for-export"),
+            lambda n: n["cleanup"].update(groupAbsent=False),
+            lambda n: n["descendants"].update(allAbsent=False),
+        ]:
+            check = self.preflight_check()
+            mutation(check["native"])
+            result = MODULE.preflight_check_facts({"checks": [check]})
+            self.assertEqual(result["status"], "valid")
+            self.assertEqual(result["checks"][0]["status"], "native-not-success")
+            self.assertNotIn("not-for-export", json.dumps(result))
+
     def test_typed_phases_bound_allowlisted_and_not_started(self):
         self.typed_phase(status="missing-or-unconfigured")
         self.typed_phase("browser-download", "not-started")

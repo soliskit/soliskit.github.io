@@ -225,6 +225,67 @@ SETUP_STATUSES = {
 }
 
 
+PREFLIGHT_CHECKS = ("package-status", "package-audit", "playwright-dependency-dry-run")
+
+
+def preflight_check_facts(record):
+    """Parent phase identity must already have passed phase_facts binding."""
+    checks = record.get("checks")
+    if checks is None:
+        return {"status": "unknown"}
+    try:
+        require(isinstance(checks, list) and 0 < len(checks) <= len(PREFLIGHT_CHECKS))
+        require(all(isinstance(check, dict) for check in checks))
+        require(
+            [check.get("name") for check in checks]
+            == list(PREFLIGHT_CHECKS[: len(checks)])
+        )
+        selected = []
+        for check in checks:
+            native = check.get("native")
+            require(isinstance(native, dict))
+            require(type(native.get("rc")) is int and -255 <= native["rc"] <= 255)
+            require(
+                all(type(native.get(key)) is bool for key in ("timeout", "interrupted"))
+            )
+            for field, flag in (
+                ("cleanup", "groupAbsent"),
+                ("descendants", "allAbsent"),
+            ):
+                require(isinstance(native.get(field), dict))
+                require(type(native[field].get(flag)) is bool)
+            facts = native_facts(native)
+            healthy = (
+                native["rc"] == 0
+                and not native["timeout"]
+                and not native["interrupted"]
+                and not facts["errorPresent"]
+                and not facts["receiptWriteErrorPresent"]
+                and facts["cleanup"].get("groupAbsent") is True
+                and facts["descendants"].get("allAbsent") is True
+                and not any(
+                    value
+                    for key, value in facts["cleanup"].items()
+                    if key != "groupAbsent"
+                )
+                and not any(
+                    value
+                    for key, value in facts["descendants"].items()
+                    if key != "allAbsent"
+                )
+            )
+            selected.append(
+                {
+                    "check": check["name"],
+                    "status": "native-success" if healthy else "native-not-success",
+                    "native": facts,
+                }
+            )
+        return {"status": "valid", "checks": selected}
+    except (ValueError, KeyError, TypeError):
+        return {"status": "unknown"}
+
+
 def phase_facts(record, phase, state):
     require(record.get("schema") == 1 and type(record["schema"]) is int)
     require(record.get("phase") == phase)
@@ -262,6 +323,8 @@ def phase_facts(record, phase, state):
     else:
         require(isinstance(record.get("native"), dict))
         result["native"] = native_facts(record["native"])
+    if phase == "dependency-preflight":
+        result["checkOutcomes"] = preflight_check_facts(record)
     return result
 
 
