@@ -1,6 +1,7 @@
 """Export typed failure facts, never raw logs or publishable release evidence."""
 
 import json
+import math
 import os
 import pathlib
 import re
@@ -211,6 +212,75 @@ def setup_phase_facts(paths, environment):
     return {**result, "classification": classification, "streams": streams}
 
 
+SETUP_PHASES = ("dependency-preflight", "browser-download")
+SETUP_STATUSES = {
+    "installed",
+    "missing-or-unconfigured",
+    "unsupported",
+    "parse-or-command-error",
+    "timeout",
+    "not-started",
+    "failure",
+    "downloaded",
+}
+
+
+def phase_facts(record, phase, state):
+    require(record.get("schema") == 1 and type(record["schema"]) is int)
+    require(record.get("phase") == phase)
+    require(isinstance(record.get("status"), str))
+    require(record["status"] in SETUP_STATUSES)
+    allowed = (
+        SETUP_STATUSES - {"downloaded"}
+        if phase == "dependency-preflight"
+        else {
+            "downloaded",
+            "parse-or-command-error",
+            "timeout",
+            "not-started",
+            "failure",
+        }
+    )
+    require(record["status"] in allowed)
+    expected = {
+        "QUALIFICATION_HEAD": state["head"],
+        "GITHUB_SHA": state.get("hostHead"),
+        "GITHUB_RUN_ID": state["run"],
+        "GITHUB_RUN_ATTEMPT": state["attempt"],
+    }
+    require(isinstance(expected["GITHUB_SHA"], str))
+    require(bool(re.fullmatch(r"[a-f0-9]{40}", expected["GITHUB_SHA"])))
+    require(record.get("identity") == expected)
+    result = {"phase": phase, "status": record["status"], "identityMatched": True}
+    if "elapsedSeconds" in record:
+        elapsed = record["elapsedSeconds"]
+        require(type(elapsed) in (float, int))
+        require(math.isfinite(elapsed) and 0 <= elapsed <= 390)
+        result["elapsedSeconds"] = elapsed
+    if record["status"] == "not-started":
+        require(record.get("native") is None)
+    else:
+        require(isinstance(record.get("native"), dict))
+        result["native"] = native_facts(record["native"])
+    return result
+
+
+def typed_setup_results(paths, state):
+    prefix = "privileged-setup/"
+    return {
+        "schema": 1,
+        "phaseOrder": list(SETUP_PHASES),
+        "phases": {
+            phase: nested_receipt(
+                paths,
+                prefix + phase + ".json",
+                lambda record, selected=phase: phase_facts(record, selected, state),
+            )
+            for phase in SETUP_PHASES
+        },
+    }
+
+
 def setup_results(paths):
     prefix = "privileged-setup/"
     return {
@@ -291,6 +361,7 @@ def export(source, destination, environment):
                 item["streams"][suffix] = {"bytes": len(data)}
         if name == "hosted-browser-install-once":
             item["setupResults"] = setup_results(paths)
+            item["typedSetupResults"] = typed_setup_results(paths, state)
             item["setupPhaseFacts"] = setup_phase_facts(paths, environment)
         output["stages"].append(item)
     encoded = (json.dumps(output, indent=2) + "\n").encode()

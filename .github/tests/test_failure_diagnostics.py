@@ -144,6 +144,107 @@ class DiagnosticsTests(unittest.TestCase):
             "setupResults"
         ]
 
+    def typed_phase(self, phase="dependency-preflight", status="installed"):
+        self.nested()
+        self.state["hostHead"] = "b" * 40
+        self.write("supervisor.json", self.state)
+        record = {
+            "schema": 1,
+            "phase": phase,
+            "status": status,
+            "identity": {
+                "QUALIFICATION_HEAD": self.state["head"],
+                "GITHUB_SHA": self.state["hostHead"],
+                "GITHUB_RUN_ID": self.state["run"],
+                "GITHUB_RUN_ATTEMPT": self.state["attempt"],
+            },
+            "elapsedSeconds": 1.25,
+            "native": {"rc": 0, "timeout": False},
+            "private": "not-selected",
+        }
+        if status == "not-started":
+            record["native"] = None
+        self.write("privileged-setup/" + phase + ".json", record)
+        return record
+
+    def typed_output(self):
+        self.export()
+        stages = json.loads((self.target / "summary.json").read_text())["stages"]
+        return next(x for x in stages if x["stage"] == "hosted-browser-install-once")[
+            "typedSetupResults"
+        ]
+
+    def test_typed_phases_bound_allowlisted_and_not_started(self):
+        self.typed_phase(status="missing-or-unconfigured")
+        self.typed_phase("browser-download", "not-started")
+        result = self.typed_output()
+        self.assertEqual(result["phaseOrder"], list(MODULE.SETUP_PHASES))
+        preflight = result["phases"]["dependency-preflight"]
+        self.assertEqual(preflight["status"], "valid")
+        self.assertTrue(preflight["facts"]["identityMatched"])
+        self.assertEqual(preflight["facts"]["status"], "missing-or-unconfigured")
+        download = result["phases"]["browser-download"]["facts"]
+        self.assertEqual(download["status"], "not-started")
+        self.assertNotIn("native", download)
+        self.assertNotIn("not-selected", json.dumps(result))
+
+    def test_typed_unknown_missing_and_old_receipt_remain_unknown(self):
+        self.nested(native={"rc": -15, "timeout": True})
+        result = self.typed_output()
+        for phase in MODULE.SETUP_PHASES:
+            self.assertEqual(result["phases"][phase]["status"], "missing")
+
+    def test_typed_identity_status_elapsed_and_native_fail_closed(self):
+        cases = [
+            ("schema", True),
+            ("phase", "other"),
+            ("identity", {}),
+            ("status", "arbitrary-private-message"),
+            ("status", []),
+            ("status", {}),
+            ("status", "downloaded"),
+            ("elapsedSeconds", True),
+            ("elapsedSeconds", float("nan")),
+            ("elapsedSeconds", float("inf")),
+            ("elapsedSeconds", 391),
+            ("native", None),
+            ("native", {"rc": "secret"}),
+        ]
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                record = self.typed_phase()
+                record[field] = value
+                self.write("privileged-setup/dependency-preflight.json", record)
+                paths = {
+                    "privileged-setup/dependency-preflight.json": self.source
+                    / "privileged-setup/dependency-preflight.json"
+                }
+                result = MODULE.typed_setup_results(paths, self.state)
+                self.assertEqual(
+                    result["phases"]["dependency-preflight"]["status"], "invalid"
+                )
+                self.assertNotIn("facts", result["phases"]["dependency-preflight"])
+
+    def test_typed_each_closed_failure_status_and_download_success(self):
+        for phase, status in [("browser-download", "downloaded")] + [
+            ("dependency-preflight", status)
+            for status in [
+                "installed",
+                "unsupported",
+                "parse-or-command-error",
+                "timeout",
+                "failure",
+            ]
+        ]:
+            with self.subTest(phase=phase, status=status):
+                self.typed_phase(phase, status)
+                paths = {
+                    "privileged-setup/" + phase + ".json": self.source
+                    / ("privileged-setup/" + phase + ".json")
+                }
+                result = MODULE.typed_setup_results(paths, self.state)
+                self.assertEqual(result["phases"][phase]["status"], "valid")
+
     def test_nested_valid_typed_fields_only(self):
         self.nested(
             {
