@@ -327,6 +327,134 @@ class DiagnosticsTests(unittest.TestCase):
         text = (self.target / "summary.json").read_text()
         self.assertNotIn("setupResults", text)
 
+    def phase(self, stdout=None, stderr=None, environment=None):
+        self.nested({"verdict": "INCOMPLETE"}, {"rc": -15, "timeout": True})
+        for suffix, value in [("stdout", stdout), ("stderr", stderr)]:
+            if value is not None:
+                (
+                    self.source / ("privileged-setup/fixed-browser-setup." + suffix)
+                ).write_bytes(value)
+        self.export(environment)
+        summary = json.loads((self.target / "summary.json").read_text())
+        return next(
+            x for x in summary["stages"] if x["stage"] == "hosted-browser-install-once"
+        )["setupPhaseFacts"]
+
+    def test_phase_package_markers_only_not_root_cause(self):
+        result = self.phase(
+            b"Get:1 https://private.invalid sensitive-package\nReading package lists...\n",
+            b"E: Failed to fetch https://private.invalid\n",
+        )
+        self.assertTrue(result["packageSetupActivity"])
+        self.assertFalse(result["browserDownloadActivity"])
+        self.assertTrue(result["fetchErrorActivity"])
+        self.assertEqual(result["classification"], "package-setup-markers-present")
+        text = (self.target / "summary.json").read_text()
+        for value in ["private.invalid", "sensitive-package", "https://", "sha256"]:
+            self.assertNotIn(value, text)
+
+    def test_phase_browser_markers(self):
+        result = self.phase(
+            b"Downloading Chromium 123 from https://private.invalid\n", b""
+        )
+        self.assertTrue(result["browserDownloadActivity"])
+        self.assertFalse(result["packageSetupActivity"])
+        self.assertEqual(result["classification"], "browser-download-markers-present")
+
+    def test_phase_unknown_missing_unfamiliar_and_malformed(self):
+        for stdout, stderr in [(None, None), (b"unfamiliar text", b""), (b"\xff", b"")]:
+            with self.subTest(stdout=stdout):
+                result = MODULE.setup_phase_facts({}, {}) if stdout is None else None
+                if result is None:
+                    directory = self.source / "privileged-setup"
+                    directory.mkdir(exist_ok=True)
+                    (directory / "fixed-browser-setup.stdout").write_bytes(stdout)
+                    (directory / "fixed-browser-setup.stderr").write_bytes(stderr)
+                    result = MODULE.setup_phase_facts(
+                        {
+                            x.relative_to(self.source).as_posix(): x
+                            for x in directory.iterdir()
+                        },
+                        {},
+                    )
+                self.assertEqual(result["classification"], "unknown")
+
+    def test_phase_secret_stream_does_not_supply_categories(self):
+        secret = "unique-unpatterned-sensitive-value"
+        result = self.phase(
+            ("Downloading Chromium " + secret).encode(), b"", {"AUTH": secret}
+        )
+        self.assertIsNone(result["browserDownloadActivity"])
+        self.assertEqual(result["classification"], "unknown")
+        self.assertNotIn(secret, (self.target / "summary.json").read_text())
+
+    def test_phase_patterned_secret_does_not_supply_categories(self):
+        result = self.phase(
+            b"Reading package lists\nauthorization: privatevalue\n", b""
+        )
+        self.assertIsNone(result["packageSetupActivity"])
+        self.assertEqual(result["streams"]["stdout"]["status"], "unknown")
+
+    def test_phase_mixed_markers_fixed_schema(self):
+        result = self.phase(
+            b"Reading package lists...\n", b"Downloading Chromium 123\n"
+        )
+        self.assertEqual(result["classification"], "mixed-phase-markers-present")
+        self.assertEqual(
+            set(result),
+            {
+                "packageSetupActivity",
+                "browserDownloadActivity",
+                "fetchErrorActivity",
+                "classification",
+                "streams",
+            },
+        )
+        for key in [
+            "packageSetupActivity",
+            "browserDownloadActivity",
+            "fetchErrorActivity",
+        ]:
+            self.assertIn(result[key], [True, False, None])
+        self.assertEqual(set(result["streams"]), {"stdout", "stderr"})
+        for stream in result["streams"].values():
+            self.assertEqual(set(stream), {"present", "bytes", "status"})
+            self.assertIs(type(stream["present"]), bool)
+            self.assertIs(type(stream["bytes"]), int)
+            self.assertIn(stream["status"], ["unknown", "classified"])
+
+    def test_phase_secret_stdout_safe_stderr(self):
+        result = self.phase(
+            b"Reading package lists\nauthorization: privatevalue\n",
+            b"Downloading Chromium 123\n",
+        )
+        self.assertIsNone(result["packageSetupActivity"])
+        self.assertTrue(result["browserDownloadActivity"])
+        self.assertEqual(result["classification"], "browser-download-markers-present")
+
+    def test_phase_missing_stream_with_safe_marker(self):
+        result = self.phase(b"Reading package lists...\n", None)
+        self.assertTrue(result["packageSetupActivity"])
+        self.assertIsNone(result["browserDownloadActivity"])
+        self.assertEqual(result["classification"], "package-setup-markers-present")
+
+    def test_phase_both_empty_streams_unknown(self):
+        result = self.phase(b"", b"")
+        self.assertFalse(result["packageSetupActivity"])
+        self.assertFalse(result["browserDownloadActivity"])
+        self.assertFalse(result["fetchErrorActivity"])
+        self.assertEqual(result["classification"], "unknown")
+
+    def test_phase_nested_stream_symlink_and_oversize_refused(self):
+        self.nested()
+        path = self.source / "privileged-setup/fixed-browser-setup.stdout"
+        path.symlink_to(self.source / "install-once.stderr")
+        self.refused()
+        path.unlink()
+        path.write_bytes(b"x" * 1024)
+        with mock.patch.object(MODULE, "MAX_FILE", 512):
+            self.refused()
+
     def test_workflow_preserves_failure_and_release_boundary(self):
         text = (pathlib.Path(__file__).parents[1] / "workflows/pages.yml").read_text()
         diagnostics = text.split("      - name: Select safe failure diagnostics", 1)[1]

@@ -154,6 +154,63 @@ def native_facts(record):
     return result
 
 
+PHASE_MARKERS = {
+    "packageSetupActivity": re.compile(
+        r"(?im)^(?:Hit:|Get:|Ign:|Err:)\d+ |^Reading package lists|"
+        r"^Building dependency tree|^Preparing to unpack |^Unpacking |^Setting up "
+    ),
+    "browserDownloadActivity": re.compile(
+        r"(?im)^Downloading (?:Chromium|Chrome for Testing|WebKit|Firefox|FFMPEG)\b"
+    ),
+    "fetchErrorActivity": re.compile(
+        r"(?im)^E: Failed to fetch |^W: Failed to fetch |"
+        r"^Error: Download failed|^Error: Request to .* timed out"
+    ),
+}
+
+
+def setup_phase_facts(paths, environment):
+    """Fixed observations only. Never include output text or its digest."""
+    streams = {}
+    observed = dict.fromkeys(PHASE_MARKERS, False)
+    complete = True
+    for suffix in ["stdout", "stderr"]:
+        name = "privileged-setup/fixed-browser-setup." + suffix
+        if name not in paths:
+            streams[suffix] = {"present": False, "status": "unknown"}
+            complete = False
+            continue
+        data = safe_read(paths[name])
+        fact = {"present": True, "bytes": len(data), "status": "unknown"}
+        streams[suffix] = fact
+        try:
+            text = data.decode("utf8")
+        except UnicodeError:
+            complete = False
+            continue
+        if SECRET.search(text) or any(
+            value in text for value in environment_secrets(environment)
+        ):
+            complete = False
+            continue
+        fact["status"] = "classified"
+        for key, marker in PHASE_MARKERS.items():
+            observed[key] = observed[key] or bool(marker.search(text))
+    result = {
+        key: True if value else False if complete else None
+        for key, value in observed.items()
+    }
+    if result["packageSetupActivity"] and result["browserDownloadActivity"]:
+        classification = "mixed-phase-markers-present"
+    elif result["browserDownloadActivity"]:
+        classification = "browser-download-markers-present"
+    elif result["packageSetupActivity"]:
+        classification = "package-setup-markers-present"
+    else:
+        classification = "unknown"
+    return {**result, "classification": classification, "streams": streams}
+
+
 def setup_results(paths):
     prefix = "privileged-setup/"
     return {
@@ -234,6 +291,7 @@ def export(source, destination, environment):
                 item["streams"][suffix] = {"bytes": len(data)}
         if name == "hosted-browser-install-once":
             item["setupResults"] = setup_results(paths)
+            item["setupPhaseFacts"] = setup_phase_facts(paths, environment)
         output["stages"].append(item)
     encoded = (json.dumps(output, indent=2) + "\n").encode()
     text = encoded.decode()
