@@ -42,8 +42,8 @@ jobs:
       - uses: actions/setup-python@v6
       - run: python3 -m unittest discover -s .github/tests -p 'test_*.py'
       - run: python3 -m pip install ruff==0.17.4
-      - run: ruff check .github/scripts/tetris_release.py .github/scripts/failure_diagnostics.py .github/tests
-      - run: ruff format --check .github/scripts/tetris_release.py .github/scripts/failure_diagnostics.py .github/tests
+      - run: ruff check .github/scripts/tetris_release.py .github/scripts/failure_diagnostics.py .github/scripts/install_browser_packages.py .github/tests
+      - run: ruff format --check .github/scripts/tetris_release.py .github/scripts/failure_diagnostics.py .github/scripts/install_browser_packages.py .github/tests
 
   qualify:
     if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.site_qualification_run == ''
@@ -74,6 +74,8 @@ jobs:
         with:
           node-version: 26.13.0
           package-manager-cache: false
+      - name: Install the pinned browser operating-system packages
+        run: python3 .github/scripts/install_browser_packages.py tetris-source/.github/offline-current/browser-dependencies.json
       - name: Run the reviewed owned qualification on exact main source
         working-directory: tetris-source
         env:
